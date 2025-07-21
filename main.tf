@@ -1,12 +1,15 @@
-# Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
+################################################################################
+# Provider
+################################################################################
 
 provider "aws" {
   region = var.region
 }
 
-# Filter out local zones, which are not currently supported 
-# with managed node groups
+
+################################################################################
+# VPC
+################################################################################
 data "aws_availability_zones" "available" {
   filter {
     name   = "opt-in-status"
@@ -15,48 +18,61 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  cluster_name = "education-eks-${random_string.suffix.result}"
+  cluster_name = "eks-karpenter-1"
+
+  tags = {
+    Example    = local.cluster_name
+    GithubRepo = "terraform-aws-eks"
+    GithubOrg  = "terraform-aws-modules"
+  }
 }
 
-resource "random_string" "suffix" {
-  length  = 8
-  special = false
-}
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.8.1"
 
-  name = "education-vpc"
+  name = "karpenter-vpc-eks"
 
   cidr = "10.0.0.0/16"
   azs  = slice(data.aws_availability_zones.available.names, 0, 3)
 
   private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
   public_subnets  = ["10.0.4.0/24", "10.0.5.0/24", "10.0.6.0/24"]
+  # intra_subnets   = ["10.0.7.0/24", "10.0.8.0/24", "10.0.9.0/24"]
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true
-  enable_dns_hostnames = true
+  enable_nat_gateway     = true
+  single_nat_gateway     = true
+  enable_dns_hostnames   = true
+  enable_dns_support     = true
+  one_nat_gateway_per_az = false
 
   public_subnet_tags = {
     "kubernetes.io/role/elb" = 1
   }
 
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
-  }
+  # private_subnet_tags = {
+  #   "kubernetes.io/role/internal-elb" = 1
+  #   # Tags subnets for Karpenter auto-discovery
+  #   "karpenter.sh/discovery" = local.cluster_name
+  # }
 }
+
+################################################################################
+# EKS Module
+################################################################################
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "20.8.5"
 
   cluster_name    = local.cluster_name
-  cluster_version = "1.29"
+  cluster_version = "1.30"
 
   cluster_endpoint_public_access           = true
   enable_cluster_creator_admin_permissions = true
+
+  enable_irsa = true
 
   cluster_addons = {
     aws-ebs-csi-driver = {
@@ -64,37 +80,59 @@ module "eks" {
     }
   }
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id                   = module.vpc.vpc_id
+  subnet_ids               = module.vpc.private_subnets
+  # control_plane_subnet_ids = module.vpc.intra_subnets
+
 
   eks_managed_node_group_defaults = {
     ami_type = "AL2_x86_64"
 
+    tags = {
+      "karpenter.sh/discovery" = local.cluster_name
+    }
   }
 
   eks_managed_node_groups = {
     one = {
-      name = "node-group-1"
+      name = "eks-managed-node"
 
-      instance_types = ["t3.small"]
+      instance_types = ["t3.medium"]
 
       min_size     = 1
-      max_size     = 3
+      max_size     = 10
       desired_size = 2
+
+      # taints = {
+      #   # This Taint aims to keep just EKS Addons and Karpenter running on this MNG
+      #   # The pods that do not tolerate this taint should run on nodes created by Karpenter
+      #   addons = {
+      #     key    = "CriticalAddonsOnly"
+      #     value  = "true"
+      #     effect = "NO_SCHEDULE"
+      #   }
+      # }
     }
 
     two = {
       name = "node-group-2"
 
-      instance_types = ["t3.small"]
+      instance_types = ["t3.medium"]
+      capacity_type  = "SPOT"
 
       min_size     = 1
       max_size     = 2
       desired_size = 1
     }
   }
-}
 
+  # node_security_group_tags = {
+  #   # NOTE - if creating multiple security groups with this module, only tag the
+  #   # security group that Karpenter should utilize with the following tag
+  #   # (i.e. - at most, only one security group should have this tag in your account)
+  #   "karpenter.sh/discovery" = local.cluster_name
+  # }
+}
 
 # https://aws.amazon.com/blogs/containers/amazon-ebs-csi-driver-is-now-generally-available-in-amazon-eks-add-ons/ 
 data "aws_iam_policy" "ebs_csi_policy" {
@@ -111,3 +149,9 @@ module "irsa-ebs-csi" {
   role_policy_arns              = [data.aws_iam_policy.ebs_csi_policy.arn]
   oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
 }
+
+################################################################################
+# EKS Auto Mode Module
+################################################################################
+
+# https://marcincuber.medium.com/amazon-eks-auto-mode-with-terraform-8b15c2f1aa62

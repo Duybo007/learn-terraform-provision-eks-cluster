@@ -8,11 +8,16 @@ terraform {
   #     name = "learn-terraform-eks"
   #   }
   # }
+  backend "s3" {
+    bucket = "binh-aws-bucket"
+    region = "us-west-1"
+    key    = "karpenter.tfstate"
+  }
 
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.47.0"
+      version = "~> 5.0"
     }
 
     random = {
